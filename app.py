@@ -1,5 +1,15 @@
-"""Streamlit application for the Balistik_valk trajectory tools.
+"""Streamlit app for Balistik_valk ballistic trajectory calculations.
 
+This app:
+- uses the repo's existing atmosphere.py, drag.py, solver.py, and stability.py
+- accepts Metric or Imperial inputs
+- fetches current weather from Open-Meteo
+- computes a trajectory with the current solver API
+- displays a drop-vs-range plot, trajectory table, CSV export, and JSON config I/O
+
+The current repository does not yet include drift.py or monte_carlo.py, so they are
+imported defensively and treated as optional.
+"""
 The UI accepts Metric or Imperial values, converts them to SI, and uses the
 repository's SI physics modules. Optional drift/Monte Carlo modules are loaded
 when present so the app remains usable while those modules are developed.
