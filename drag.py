@@ -1,8 +1,7 @@
 """Drag-coefficient lookup and interpolation for standard ballistic tables.
 
-The repository's original G1/G7 tables are converted to cached 201-point cubic
-spline tables on first use when no checked-in ``*_fine.csv`` file exists. This
-keeps the source/reference data intact while providing a denser Mach grid.
+When no checked-in ``*_fine.csv`` is present, the source G1/G7 table is
+interpolated onto a 200-point Mach grid with a cubic spline and cached locally.
 """
 
 from __future__ import annotations
@@ -17,37 +16,7 @@ from scipy.interpolate import CubicSpline
 
 
 SUPPORTED_PROFILES: Sequence[str] = ("g1", "g7")
-FINE_TABLE_POINT_COUNT: int = 201
-
-
-def _resolve_csv_path(
-    profile: str,
-    csv_path: str | Path | None = None,
-) -> Path:
-    """Resolve a preferred fine table or the source table for a profile.
-
-    Args:
-        profile: Table name, such as "g1" or "g7".
-        csv_path: Optional explicit file path override.
-
-    Returns:
-        Fine table path when available, otherwise the source table path.
-    """
-    normalized = profile.strip().lower()
-    if normalized not in SUPPORTED_PROFILES:
-        raise ValueError(f"Unsupported drag profile '{profile}'.")
-    if csv_path is not None:
-        return Path(csv_path)
-
-    repo_root = Path(__file__).resolve().parent
-    fine_path = repo_root / "data" / f"{normalized}_fine.csv"
-    source_path = repo_root / "data" / f"{normalized}.csv"
-    if fine_path.exists():
-        return fine_path
-    if not source_path.exists():
-        raise FileNotFoundError(f"Drag table not found: {source_path}")
-    _generate_fine_table(source_path, fine_path)
-    return fine_path if fine_path.exists() else source_path
+FINE_TABLE_POINT_COUNT: int = 200
 
 
 def _read_table(path: Path) -> List[Tuple[float, float]]:
@@ -66,7 +35,7 @@ def _read_table(path: Path) -> List[Tuple[float, float]]:
         for row in reader:
             mach_value = row.get(field_map["mach"])
             cd_value = row.get(field_map["cd"])
-            if mach_value is None or cd_value is None:
+            if mach_value is None or cd_value is None or not mach_value.strip() or not cd_value.strip():
                 continue
             table.append((float(mach_value), float(cd_value)))
 
@@ -79,14 +48,14 @@ def _read_table(path: Path) -> List[Tuple[float, float]]:
 
 
 def _generate_fine_table(source_path: Path, fine_path: Path) -> None:
-    """Write a 201-point cubic-spline interpolation of a source drag table.
+    """Generate a 200-point cubic-spline CSV unless it already exists.
 
     Args:
-        source_path: Original G1/G7 CSV table.
-        fine_path: Destination ``*_fine.csv`` path.
+        source_path: Original G1/G7 source CSV.
+        fine_path: Destination fine CSV.
 
     Returns:
-        None. Existing fine tables are left untouched.
+        None.
     """
     if fine_path.exists():
         return
@@ -104,6 +73,30 @@ def _generate_fine_table(source_path: Path, fine_path: Path) -> None:
         writer.writerows((f"{m:.8f}", f"{c:.10f}") for m, c in zip(fine_mach, fine_cd))
 
 
+def _resolve_csv_path(profile: str, csv_path: str | Path | None = None) -> Path:
+    """Resolve explicit table or prefer the fine table, generating it if needed."""
+    normalized = profile.strip().lower()
+    if normalized not in SUPPORTED_PROFILES:
+        raise ValueError(f"Unsupported drag profile '{profile}'.")
+    if csv_path is not None:
+        return Path(csv_path)
+
+    data_dir = Path(__file__).resolve().parent / "data"
+    fine_path = data_dir / f"{normalized}_fine.csv"
+    source_path = data_dir / f"{normalized}.csv"
+    if fine_path.exists():
+        return fine_path
+    if not source_path.exists():
+        raise FileNotFoundError(f"Drag table not found: {source_path}")
+    # Generate the fine CSV from the original table when it is absent; the
+    # original is preserved and remains the fallback if generation fails.
+    try:
+        _generate_fine_table(source_path, fine_path)
+    except (OSError, ValueError):
+        return source_path
+    return fine_path if fine_path.exists() else source_path
+
+
 @lru_cache(maxsize=4)
 def _load_cached(path_string: str) -> tuple[tuple[float, float], ...]:
     """Cache parsed table contents so solver RHS evaluations avoid repeated I/O."""
@@ -114,14 +107,14 @@ def load_drag_table(
     profile: str,
     csv_path: str | Path | None = None,
 ) -> List[Tuple[float, float]]:
-    """Load a preferred fine or explicit drag table.
+    """Load a preferred fine table or an explicitly supplied source table.
 
     Args:
         profile: Table name, such as "g1" or "g7".
-        csv_path: Optional explicit file path override, which bypasses preference.
+        csv_path: Optional explicit file path override.
 
     Returns:
-        A sorted list of (Mach, Cd) pairs.
+        Sorted list of (Mach, Cd) pairs.
     """
     path = _resolve_csv_path(profile, csv_path)
     return list(_load_cached(str(path.resolve())))
@@ -132,7 +125,7 @@ def interpolate_cd(
     profile: str,
     csv_path: str | Path | None = None,
 ) -> float:
-    """Return the drag coefficient at Mach by linear interpolation on the fine grid.
+    """Return Cd by linear interpolation on the selected Mach/Cd table.
 
     Args:
         mach: Mach number.
@@ -140,7 +133,7 @@ def interpolate_cd(
         csv_path: Optional explicit file path override.
 
     Returns:
-        Interpolated Cd value.
+        Interpolated Cd; values outside the table domain use endpoint values.
     """
     if mach < 0.0:
         raise ValueError("Mach number must be non-negative.")
@@ -154,8 +147,8 @@ if __name__ == "__main__":
     g1_table = load_drag_table("g1")
     g7_table = load_drag_table("g7")
 
-    assert len(g1_table) >= 200
-    assert len(g7_table) >= 200
+    assert len(g1_table) == FINE_TABLE_POINT_COUNT
+    assert len(g7_table) == FINE_TABLE_POINT_COUNT
     assert abs(interpolate_cd(1.0, "g1") - 0.4805) < 0.05
     assert abs(interpolate_cd(1.0, "g7") - 0.3803) < 0.05
     assert abs(interpolate_cd(0.5, "g1") - 0.2032) < 0.05
