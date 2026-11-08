@@ -1,14 +1,15 @@
 """Streamlit interface for the Balistik_valk ballistics tools.
 
-This final app shell exposes atmospheric conditions, gyroscopic stability,
-reference drag tables, and a working point-mass trajectory calculation.
+The UI is a thin presentation layer: user-entered values are converted to SI
+units here, then passed to the atmosphere, drag, stability, and solver modules.
 """
 
 from __future__ import annotations
 
 import math
+import platform
 import sys
-from typing import Tuple
+from typing import Any, Tuple
 
 
 APP_TITLE: str = "Balistik_valk Ballistics"
@@ -20,7 +21,6 @@ DEFAULT_MASS_KG: float = 0.01134
 DEFAULT_DIAMETER_M: float = 0.00782
 DEFAULT_LENGTH_M: float = 0.03150
 DEFAULT_TWIST_M_PER_TURN: float = 0.254
-FEET_PER_METER: float = 1.0 / 0.3048
 INCHES_PER_METER: float = 1.0 / 0.0254
 GRAINS_PER_KILOGRAM: float = 1.0 / 0.00006479891
 PASCALS_PER_HPA: float = 100.0
@@ -32,7 +32,7 @@ def _mass_to_kg(value: float, unit: str) -> float:
 
     Args:
         value: Mass in the selected display unit.
-        unit: Either "g", "gr", or "kg".
+        unit: One of "g", "gr", or "kg".
 
     Returns:
         Mass in kilograms.
@@ -48,12 +48,12 @@ def _length_to_m(value: float, unit: str) -> float:
 
     Args:
         value: Length in the selected display unit.
-        unit: Either "m", "mm", or "in".
+        unit: One of "m", "mm", or "in".
 
     Returns:
         Length in meters.
     """
-    factors = {"m": 1.0, "mm": 0.001, "in": 1.0 / INCHES_PER_METER}
+    factors = {"m": 1.0, "mm": 0.001, "in": 0.0254}
     if unit not in factors:
         raise ValueError(f"Unsupported length unit: {unit}")
     return value * factors[unit]
@@ -97,7 +97,7 @@ def _pressure_to_pa(value: float, unit: str) -> float:
 
     Args:
         value: Pressure in the selected display unit.
-        unit: Either "Pa", "hPa", or "inHg".
+        unit: One of "Pa", "hPa", or "inHg".
 
     Returns:
         Pressure in pascals.
@@ -124,19 +124,88 @@ def _display_units(system: str) -> Tuple[str, str, str, str, str]:
     raise ValueError(f"Unsupported unit system: {system}")
 
 
-def _render_atmosphere_tab(
-    st: object,
-    pressure_pa: float,
-    temperature_c: float,
-    relative_humidity: float,
-) -> None:
-    """Show estimated air properties for the selected conditions.
+def _si_inputs(
+    mass_value: float,
+    mass_unit: str,
+    diameter_value: float,
+    length_value: float,
+    twist_value: float,
+    length_unit: str,
+    velocity_value: float,
+    velocity_unit: str,
+    pressure_value: float,
+    pressure_unit: str,
+    temperature_value: float,
+    temperature_unit: str,
+    humidity_percent: float,
+) -> dict[str, float]:
+    """Convert and validate all user-facing inputs into SI values.
+
+    Args:
+        mass_value: Projectile mass in its selected UI unit.
+        mass_unit: Mass unit label.
+        diameter_value: Projectile diameter in its selected UI unit.
+        length_value: Projectile length in its selected UI unit.
+        twist_value: Rifling twist length in its selected UI unit per turn.
+        length_unit: Length unit label.
+        velocity_value: Launch speed in its selected UI unit.
+        velocity_unit: Velocity unit label.
+        pressure_value: Atmospheric pressure in its selected UI unit.
+        pressure_unit: Pressure unit label.
+        temperature_value: Air temperature in its selected UI unit.
+        temperature_unit: Temperature unit label.
+        humidity_percent: Relative humidity percentage.
+
+    Returns:
+        Validated normalized SI inputs in a dictionary.
+    """
+    inputs = {
+        "mass_kg": _mass_to_kg(mass_value, mass_unit),
+        "diameter_m": _length_to_m(diameter_value, length_unit),
+        "length_m": _length_to_m(length_value, length_unit),
+        "twist_m_per_turn": _length_to_m(twist_value, length_unit),
+        "velocity_m_s": _velocity_to_m_s(velocity_value, velocity_unit),
+        "pressure_pa": _pressure_to_pa(pressure_value, pressure_unit),
+        "temperature_c": _temperature_to_c(temperature_value, temperature_unit),
+        "relative_humidity": humidity_percent / 100.0,
+    }
+    for key, value in inputs.items():
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be a finite number.")
+    for key in ("mass_kg", "diameter_m", "length_m", "twist_m_per_turn", "velocity_m_s", "pressure_pa"):
+        if inputs[key] <= 0.0:
+            raise ValueError(f"{key} must be positive.")
+    if inputs["temperature_c"] <= -273.15:
+        raise ValueError("Temperature must be above absolute zero.")
+    if not 0.0 <= inputs["relative_humidity"] <= 1.0:
+        raise ValueError("Relative humidity must be between 0 and 100%.")
+    return inputs
+
+
+def _show_error(st: Any, title: str, error: Exception, debug: bool) -> None:
+    """Display a user-friendly error and optional traceback.
+
+    Args:
+        st: Streamlit module or container.
+        title: Short context for the failed operation.
+        error: Exception raised by the calculation.
+        debug: Whether to show detailed exception information.
+
+    Returns:
+        None.
+    """
+    st.error(f"{title}: {error}")
+    if debug:
+        st.exception(error)
+
+
+def _render_atmosphere_tab(st: Any, inputs: dict[str, float], debug: bool) -> None:
+    """Show air properties for the selected atmospheric conditions.
 
     Args:
         st: Streamlit module instance.
-        pressure_pa: Ambient pressure in pascals.
-        temperature_c: Ambient temperature in degrees Celsius.
-        relative_humidity: Relative humidity as a fraction from 0 to 1.
+        inputs: Validated SI inputs.
+        debug: Whether to show traceback details on errors.
 
     Returns:
         None.
@@ -144,41 +213,33 @@ def _render_atmosphere_tab(
     from atmosphere import air_density, speed_of_sound
 
     st.subheader("Atmosphere")
-    st.caption("Air-property estimates from the atmosphere module.")
-    density = air_density(pressure_pa, temperature_c, relative_humidity)
-    sound_speed = speed_of_sound(temperature_c, pressure_pa, relative_humidity)
+    try:
+        density = air_density(
+            inputs["pressure_pa"], inputs["temperature_c"], inputs["relative_humidity"]
+        )
+        sound_speed = speed_of_sound(
+            inputs["temperature_c"], inputs["pressure_pa"], inputs["relative_humidity"]
+        )
+    except (ValueError, OverflowError) as error:
+        _show_error(st, "Could not calculate atmospheric properties", error, debug)
+        return
 
-    col_density, col_sound = st.columns(2)
-    col_density.metric("Air density", f"{density:.4f} kg/m³")
-    col_sound.metric("Speed of sound", f"{sound_speed:.2f} m/s")
-
+    density_col, sound_col = st.columns(2)
+    density_col.metric("Air density", f"{density:.4f} kg/m³")
+    sound_col.metric("Speed of sound", f"{sound_speed:.2f} m/s")
     st.caption(
-        f"Inputs: {pressure_pa:.0f} Pa, {temperature_c:.2f} °C, "
-        f"{relative_humidity * 100.0:.1f}% RH"
+        f"{inputs['pressure_pa']:.0f} Pa · {inputs['temperature_c']:.2f} °C · "
+        f"{inputs['relative_humidity'] * 100.0:.1f}% RH"
     )
 
 
-def _render_stability_tab(
-    st: object,
-    mass_kg: float,
-    diameter_m: float,
-    length_m: float,
-    twist_m_per_turn: float,
-    velocity_m_s: float,
-    temperature_c: float,
-    pressure_pa: float,
-) -> None:
+def _render_stability_tab(st: Any, inputs: dict[str, float], debug: bool) -> None:
     """Show the Miller-rule stability estimate for the selected projectile.
 
     Args:
         st: Streamlit module instance.
-        mass_kg: Projectile mass in kilograms.
-        diameter_m: Projectile diameter in meters.
-        length_m: Projectile length in meters.
-        twist_m_per_turn: Rifling twist length in meters per turn.
-        velocity_m_s: Muzzle velocity in meters per second.
-        temperature_c: Ambient temperature in degrees Celsius.
-        pressure_pa: Ambient pressure in pascals.
+        inputs: Validated SI inputs.
+        debug: Whether to show traceback details on errors.
 
     Returns:
         None.
@@ -186,29 +247,35 @@ def _render_stability_tab(
     from stability import stability_factor
 
     st.subheader("Gyroscopic stability")
-    sg = stability_factor(
-        bullet_mass_kg=mass_kg,
-        bullet_diameter_m=diameter_m,
-        bullet_length_m=length_m,
-        twist_m_per_turn=twist_m_per_turn,
-        velocity_m_s=velocity_m_s,
-        temperature_c=temperature_c,
-        pressure_pa=pressure_pa,
-    )
+    try:
+        sg = stability_factor(
+            bullet_mass_kg=inputs["mass_kg"],
+            bullet_diameter_m=inputs["diameter_m"],
+            bullet_length_m=inputs["length_m"],
+            twist_m_per_turn=inputs["twist_m_per_turn"],
+            velocity_m_s=inputs["velocity_m_s"],
+            temperature_c=inputs["temperature_c"],
+            pressure_pa=inputs["pressure_pa"],
+        )
+    except (ValueError, OverflowError, ZeroDivisionError) as error:
+        _show_error(st, "Could not calculate stability", error, debug)
+        return
+
     st.metric("Estimated Miller Sg", f"{sg:.3f}")
     st.caption(
-        "This is an empirical estimate based on the Miller twist rule, "
-        "not a guarantee of real-world in-flight behavior."
+        "Empirical Miller-rule estimate; it does not guarantee real-world "
+        "stability for a specific projectile or operating condition."
     )
 
 
-def _render_drag_tab(st: object, profile: str, mach: float) -> None:
-    """Show the selected drag table and interpolated value.
+def _render_drag_tab(st: Any, profile: str, mach: float, debug: bool) -> None:
+    """Show the selected drag table and interpolated drag coefficient.
 
     Args:
         st: Streamlit module instance.
         profile: Drag model name, "g1" or "g7".
-        mach: Mach number at which to display the interpolated coefficient.
+        mach: Mach number for interpolation.
+        debug: Whether to show traceback details on errors.
 
     Returns:
         None.
@@ -218,54 +285,80 @@ def _render_drag_tab(st: object, profile: str, mach: float) -> None:
 
     from drag import interpolate_cd, load_drag_table
 
-    table = load_drag_table(profile)
+    st.subheader(f"{profile.upper()} reference drag table")
+    try:
+        table = load_drag_table(profile)
+        cd = interpolate_cd(mach, profile)
+    except (ValueError, FileNotFoundError, OSError) as error:
+        _show_error(st, "Could not load or interpolate the drag table", error, debug)
+        return
+
+    st.metric(f"Interpolated Cd at Mach {mach:.3f}", f"{cd:.5f}")
     mach_values = [point[0] for point in table]
     cd_values = [point[1] for point in table]
-    cd = interpolate_cd(mach, profile)
-
-    st.subheader(f"{profile.upper()} reference drag table")
-    st.metric(f"Interpolated Cd at Mach {mach:.3f}", f"{cd:.5f}")
-
     figure, axis = plt.subplots()
-    axis.plot(mach_values, cd_values, label=f"{profile.upper()} table")
-    axis.scatter([mach], [cd], color="tab:red", zorder=3, label="Selected Mach")
-    axis.set_xlabel("Mach")
-    axis.set_ylabel("Cd")
-    axis.grid(True, alpha=0.3)
-    axis.legend()
-    st.pyplot(figure, clear_figure=True)
-    plt.close(figure)
+    try:
+        axis.plot(mach_values, cd_values, label=f"{profile.upper()} table")
+        axis.scatter([mach], [cd], color="tab:red", zorder=3, label="Selected Mach")
+        axis.set(xlabel="Mach", ylabel="Cd", title=f"{profile.upper()} drag curve")
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        st.pyplot(figure, clear_figure=True)
+    finally:
+        plt.close(figure)
 
-    with st.expander("View table data"):
-        frame = pd.DataFrame(table, columns=["Mach", "Cd"])
-        st.dataframe(frame, use_container_width=True, hide_index=True)
+    with st.expander("Inspect drag-table data"):
+        st.dataframe(
+            pd.DataFrame(table, columns=["Mach", "Cd"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def _run_trajectory(inputs: dict[str, float], profile: str, angle_deg: float, duration_s: float) -> Any:
+    """Run the trajectory calculation for normalized inputs.
+
+    Args:
+        inputs: Validated SI inputs.
+        profile: Drag model name.
+        angle_deg: Launch elevation in degrees.
+        duration_s: Integration duration in seconds.
+
+    Returns:
+        TrajectoryResult from the solver module.
+    """
+    from solver import solve_trajectory
+
+    return solve_trajectory(
+        mass_kg=inputs["mass_kg"],
+        diameter_m=inputs["diameter_m"],
+        drag_profile=profile,
+        launch_speed_m_s=inputs["velocity_m_s"],
+        launch_elevation_rad=math.radians(angle_deg),
+        pressure_pa=inputs["pressure_pa"],
+        temperature_c=inputs["temperature_c"],
+        relative_humidity=inputs["relative_humidity"],
+        time_end_s=duration_s,
+    )
 
 
 def _render_trajectory_tab(
-    st: object,
-    mass_kg: float,
-    diameter_m: float,
+    st: Any,
+    inputs: dict[str, float],
     profile: str,
-    launch_speed_m_s: float,
-    launch_angle_deg: float,
-    pressure_pa: float,
-    temperature_c: float,
-    relative_humidity: float,
-    time_end_s: float,
+    angle_deg: float,
+    duration_s: float,
+    debug: bool,
 ) -> None:
-    """Compute and render the projectile trajectory.
+    """Run on demand and display trajectory metrics, plot, and samples.
 
     Args:
         st: Streamlit module instance.
-        mass_kg: Projectile mass in kg.
-        diameter_m: Projectile diameter in m.
+        inputs: Validated SI inputs.
         profile: Drag model name.
-        launch_speed_m_s: Launch speed in m/s.
-        launch_angle_deg: Launch elevation in degrees.
-        pressure_pa: Ambient pressure in Pa.
-        temperature_c: Ambient temperature in degC.
-        relative_humidity: Relative humidity fraction.
-        time_end_s: End time of the simulation in seconds.
+        angle_deg: Launch elevation in degrees.
+        duration_s: Integration duration in seconds.
+        debug: Whether to show traceback details on errors.
 
     Returns:
         None.
@@ -273,44 +366,53 @@ def _render_trajectory_tab(
     import matplotlib.pyplot as plt
     import pandas as pd
 
-    from solver import solve_trajectory
-
-    result = solve_trajectory(
-        mass_kg=mass_kg,
-        diameter_m=diameter_m,
-        drag_profile=profile,
-        launch_speed_m_s=launch_speed_m_s,
-        launch_elevation_rad=math.radians(launch_angle_deg),
-        pressure_pa=pressure_pa,
-        temperature_c=temperature_c,
-        relative_humidity=relative_humidity,
-        time_end_s=time_end_s,
-    )
-
-    peak_height_m = float(result.y_m.max())
-    downrange_m = float(result.x_m[-1])
-    final_speed_m_s = float(
-        math.sqrt(
-            result.vx_m_s[-1] ** 2 + result.vy_m_s[-1] ** 2 + result.vz_m_s[-1] ** 2
-        )
-    )
-
     st.subheader("Trajectory")
-    col_height, col_range, col_speed = st.columns(3)
-    col_height.metric("Peak height", f"{peak_height_m:.2f} m")
-    col_range.metric("Downrange", f"{downrange_m:.2f} m")
-    col_speed.metric("Final speed", f"{final_speed_m_s:.2f} m/s")
+    st.caption(
+        "Point-mass RK45 integration over the requested time window. "
+        "The solver does not yet stop automatically at ground impact."
+    )
+    if not st.button("Run / update trajectory", type="primary", key="run_trajectory"):
+        st.info("Adjust the inputs, then run the trajectory calculation.")
+        return
+
+    try:
+        result = _run_trajectory(inputs, profile, angle_deg, duration_s)
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as error:
+        st.session_state.pop("trajectory_result", None)
+        _show_error(st, "Trajectory calculation failed", error, debug)
+        return
+
+    st.session_state["trajectory_result"] = result
+    peak_index = int(result.y_m.argmax())
+    final_speed = math.sqrt(
+        float(result.vx_m_s[-1]) ** 2
+        + float(result.vy_m_s[-1]) ** 2
+        + float(result.vz_m_s[-1]) ** 2
+    )
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Peak height", f"{float(result.y_m.max()):.2f} m")
+    metric_cols[1].metric("Downrange at end", f"{float(result.x_m[-1]):.2f} m")
+    metric_cols[2].metric("Final speed", f"{final_speed:.2f} m/s")
+    metric_cols[3].metric("Time to peak", f"{float(result.time_s[peak_index]):.2f} s")
 
     figure, axis = plt.subplots()
-    axis.plot(result.x_m, result.y_m, label="Projectile path")
-    axis.set_xlabel("Downrange (m)")
-    axis.set_ylabel("Altitude (m)")
-    axis.grid(True, alpha=0.3)
-    axis.legend()
-    st.pyplot(figure, clear_figure=True)
-    plt.close(figure)
+    try:
+        axis.plot(result.x_m, result.y_m, label="Projectile path")
+        axis.scatter(
+            [result.x_m[peak_index]],
+            [result.y_m[peak_index]],
+            color="tab:red",
+            label="Peak",
+            zorder=3,
+        )
+        axis.set(xlabel="Downrange (m)", ylabel="Altitude (m)", title="Trajectory")
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        st.pyplot(figure, clear_figure=True)
+    finally:
+        plt.close(figure)
 
-    summary = pd.DataFrame(
+    data = pd.DataFrame(
         {
             "time_s": result.time_s,
             "x_m": result.x_m,
@@ -321,13 +423,14 @@ def _render_trajectory_tab(
             "vz_m_s": result.vz_m_s,
         }
     )
-    with st.expander("View trajectory data"):
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    st.caption(
-        f"Launch: {launch_speed_m_s:.1f} m/s at {launch_angle_deg:.1f}°, "
-        f"profile={profile.upper()}, time_end={time_end_s:.1f} s"
-    )
+    with st.expander("Inspect trajectory samples"):
+        st.dataframe(data, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download trajectory CSV",
+            data=data.to_csv(index=False).encode("utf-8"),
+            file_name="trajectory.csv",
+            mime="text/csv",
+        )
 
 
 def main() -> None:
@@ -340,14 +443,13 @@ def main() -> None:
     st.title(APP_TITLE)
     st.write(
         "Explore atmospheric conditions, estimate gyroscopic stability, "
-        "inspect the built-in G1/G7 drag tables, and calculate a projectile path."
+        "inspect G1/G7 drag tables, and calculate a point-mass trajectory."
     )
 
     unit_system = st.sidebar.selectbox("Input units", options=("Metric", "US customary"))
     mass_unit, length_unit, velocity_unit, temperature_unit, pressure_unit = _display_units(
         unit_system
     )
-
     with st.sidebar:
         st.header("Environment")
         pressure_value = st.number_input(
@@ -365,90 +467,74 @@ def main() -> None:
 
         st.header("Projectile")
         mass_value = st.number_input(
-            f"Mass ({mass_unit})",
-            min_value=0.001,
-            value=11.34 if mass_unit == "g" else 175.0,
-            step=0.1,
+            f"Mass ({mass_unit})", min_value=0.001,
+            value=11.34 if mass_unit == "g" else 175.0, step=0.1,
         )
         diameter_value = st.number_input(
-            f"Diameter ({length_unit})",
-            min_value=0.001,
-            value=7.82 if length_unit == "mm" else 0.308,
-            step=0.01,
+            f"Diameter ({length_unit})", min_value=0.001,
+            value=7.82 if length_unit == "mm" else 0.308, step=0.01,
         )
         length_value = st.number_input(
-            f"Length ({length_unit})",
-            min_value=0.001,
-            value=31.50 if length_unit == "mm" else 1.24,
-            step=0.1,
+            f"Length ({length_unit})", min_value=0.001,
+            value=31.50 if length_unit == "mm" else 1.24, step=0.1,
         )
         twist_value = st.number_input(
-            f"Twist length ({length_unit}/turn)",
-            min_value=0.001,
-            value=254.0 if length_unit == "mm" else 10.0,
-            step=1.0,
+            f"Twist length ({length_unit}/turn)", min_value=0.001,
+            value=254.0 if length_unit == "mm" else 10.0, step=1.0,
         )
         velocity_value = st.number_input(
-            f"Muzzle velocity ({velocity_unit})",
-            min_value=0.001,
-            value=800.0 if velocity_unit == "m/s" else 2625.0,
-            step=10.0,
+            f"Muzzle velocity ({velocity_unit})", min_value=0.001,
+            value=800.0 if velocity_unit == "m/s" else 2625.0, step=10.0,
         )
-        launch_angle_deg = st.slider("Launch angle (deg)", 1.0, 80.0, 15.0, step=0.5)
-        time_end_s = st.slider("Simulation time (s)", 1.0, 30.0, 10.0, step=0.5)
+        launch_angle_deg = st.slider("Launch elevation (deg)", 0.1, 80.0, 15.0, step=0.5)
+        duration_s = st.slider("Integration duration (s)", 1.0, 30.0, 10.0, step=0.5)
 
         st.header("Drag table")
         profile = st.selectbox("Reference profile", options=SUPPORTED_PROFILES)
-        mach = st.slider("Mach number", min_value=0.0, max_value=5.0, value=1.0, step=0.01)
+        mach = st.slider("Mach for Cd lookup", 0.0, 5.0, 1.0, step=0.01)
+        debug = st.checkbox("Show detailed errors (debug)", value=False)
 
-    pressure_pa = _pressure_to_pa(pressure_value, pressure_unit)
-    temperature_c = _temperature_to_c(temperature_value, temperature_unit)
-    relative_humidity = humidity_percent / 100.0
-    mass_kg = _mass_to_kg(mass_value, mass_unit)
-    diameter_m = _length_to_m(diameter_value, length_unit)
-    length_m = _length_to_m(length_value, length_unit)
-    twist_m_per_turn = _length_to_m(twist_value, length_unit)
-    velocity_m_s = _velocity_to_m_s(velocity_value, velocity_unit)
+    try:
+        inputs = _si_inputs(
+            mass_value, mass_unit, diameter_value, length_value, twist_value, length_unit,
+            velocity_value, velocity_unit, pressure_value, pressure_unit,
+            temperature_value, temperature_unit, float(humidity_percent),
+        )
+    except ValueError as error:
+        st.error(f"Please check the input values: {error}")
+        if debug:
+            st.exception(error)
+        return
 
     atmosphere_tab, stability_tab, drag_tab, trajectory_tab = st.tabs(
         ("Atmosphere", "Stability", "Drag tables", "Trajectory")
     )
-
     with atmosphere_tab:
-        _render_atmosphere_tab(st, pressure_pa, temperature_c, relative_humidity)
-
+        _render_atmosphere_tab(st, inputs, debug)
     with stability_tab:
-        _render_stability_tab(
-            st,
-            mass_kg,
-            diameter_m,
-            length_m,
-            twist_m_per_turn,
-            velocity_m_s,
-            temperature_c,
-            pressure_pa,
-        )
-
+        _render_stability_tab(st, inputs, debug)
     with drag_tab:
-        _render_drag_tab(st, profile, mach)
-
+        _render_drag_tab(st, profile, mach, debug)
     with trajectory_tab:
-        _render_trajectory_tab(
-            st,
-            mass_kg,
-            diameter_m,
-            profile,
-            velocity_m_s,
-            launch_angle_deg,
-            pressure_pa,
-            temperature_c,
-            relative_humidity,
-            time_end_s,
-        )
+        _render_trajectory_tab(st, inputs, profile, launch_angle_deg, duration_s, debug)
+
+    if debug:
+        with st.expander("Debug: normalized inputs and runtime"):
+            st.json(
+                {
+                    "si_inputs": inputs,
+                    "drag_profile": profile,
+                    "drag_lookup_mach": mach,
+                    "launch_angle_deg": launch_angle_deg,
+                    "integration_duration_s": duration_s,
+                    "python": sys.version,
+                    "platform": platform.platform(),
+                }
+            )
 
 
 def _self_test() -> None:
-    """Run lightweight checks for conversions and existing calculation modules."""
+    """Run quick checks for UI conversions and the project's calculation modules."""
     from atmosphere import air_density, speed_of_sound
     from drag import interpolate_cd, load_drag_table
     from solver import solve_trajectory
@@ -461,33 +547,26 @@ def _self_test() -> None:
     assert math.isclose(_pressure_to_pa(1.0, "hPa"), 100.0)
     assert _display_units("Metric") == ("g", "mm", "m/s", "°C", "hPa")
 
+    normalized = _si_inputs(
+        175.0, "gr", 0.308, 1.24, 10.0, "in", 2625.0, "ft/s",
+        29.92, "inHg", 59.0, "°F", 50.0,
+    )
+    assert math.isclose(normalized["mass_kg"], 175.0 / GRAINS_PER_KILOGRAM)
     assert air_density(DEFAULT_PRESSURE_PA, DEFAULT_TEMPERATURE_C) > 0.0
     assert speed_of_sound(DEFAULT_TEMPERATURE_C) > 0.0
-    assert len(load_drag_table("g1")) > 1
-    assert len(load_drag_table("g7")) > 1
-    assert interpolate_cd(1.0, "g1") > 0.0
-    assert interpolate_cd(1.0, "g7") > 0.0
+    assert len(load_drag_table("g1")) > 1 and len(load_drag_table("g7")) > 1
+    assert interpolate_cd(1.0, "g1") > 0.0 and interpolate_cd(1.0, "g7") > 0.0
     assert stability_factor(
-        DEFAULT_MASS_KG,
-        DEFAULT_DIAMETER_M,
-        DEFAULT_LENGTH_M,
-        DEFAULT_TWIST_M_PER_TURN,
-        DEFAULT_VELOCITY_M_S,
+        DEFAULT_MASS_KG, DEFAULT_DIAMETER_M, DEFAULT_LENGTH_M,
+        DEFAULT_TWIST_M_PER_TURN, DEFAULT_VELOCITY_M_S,
     ) > 0.0
-
-    trajectory = solve_trajectory(
-        mass_kg=0.010,
-        diameter_m=0.008,
-        drag_profile="g7",
-        launch_speed_m_s=300.0,
-        launch_elevation_rad=math.radians(12.0),
-        pressure_pa=DEFAULT_PRESSURE_PA,
-        temperature_c=DEFAULT_TEMPERATURE_C,
-        relative_humidity=0.0,
-        time_end_s=5.0,
+    result = solve_trajectory(
+        mass_kg=0.010, diameter_m=0.008, drag_profile="g7",
+        launch_speed_m_s=300.0, launch_elevation_rad=math.radians(12.0),
+        pressure_pa=DEFAULT_PRESSURE_PA, temperature_c=DEFAULT_TEMPERATURE_C,
+        relative_humidity=0.0, time_end_s=5.0,
     )
-    assert trajectory.time_s.size > 0
-    assert trajectory.y_m.max() > 0.0
+    assert result.time_s.size > 0 and result.y_m.max() > 0.0
 
 
 if __name__ == "__main__":
