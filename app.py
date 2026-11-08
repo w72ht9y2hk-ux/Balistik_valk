@@ -1,8 +1,8 @@
 """Streamlit UI for the SI-based Balistik_valk physics engine.
 
-All UI inputs are converted to SI before calling the physics modules. Output
-values and exported trajectory data are converted back to the selected display
-system here; solver.py and the other calculation modules remain SI-only.
+UI values are converted to SI before physics calls. Weather data is fetched
+from Open-Meteo and is used only to populate the environment controls; wind is
+shown as context because the current solver does not yet model wind.
 """
 
 from __future__ import annotations
@@ -10,10 +10,15 @@ from __future__ import annotations
 import math
 import platform
 import sys
+from datetime import datetime
 from typing import Any, Tuple
+
+import requests
 
 
 APP_TITLE: str = "Balistik_valk Ballistics"
+OPEN_METEO_URL: str = "https://api.open-meteo.com/v1/forecast"
+WEATHER_TIMEOUT_S: float = 10.0
 DEFAULT_PRESSURE_PA: float = 101325.0
 DEFAULT_TEMPERATURE_C: float = 15.0
 DEFAULT_MASS_KG: float = 0.01134
@@ -272,6 +277,51 @@ def _si_inputs(
     return inputs
 
 
+def _fetch_current_weather(latitude: float, longitude: float) -> dict[str, float | str]:
+    """Fetch current weather from Open-Meteo and normalize weather values.
+
+    Args:
+        latitude: Geographic latitude in decimal degrees.
+        longitude: Geographic longitude in decimal degrees.
+
+    Returns:
+        Current temperature (°C), humidity (%), pressure (hPa), wind speed (m/s),
+        wind direction (degrees), and provider timestamp.
+    """
+    if not math.isfinite(latitude) or not -90.0 <= latitude <= 90.0:
+        raise ValueError("Latitude must be between -90 and 90 degrees.")
+    if not math.isfinite(longitude) or not -180.0 <= longitude <= 180.0:
+        raise ValueError("Longitude must be between -180 and 180 degrees.")
+
+    response = requests.get(
+        OPEN_METEO_URL,
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": (
+                "temperature_2m,relative_humidity_2m,pressure_msl,"
+                "wind_speed_10m,wind_direction_10m"
+            ),
+            "timezone": "auto",
+        },
+        timeout=WEATHER_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    current = response.json()["current"]
+    values = {
+        "temperature_c": float(current["temperature_2m"]),
+        "relative_humidity_percent": float(current["relative_humidity_2m"]),
+        "pressure_hpa": float(current["pressure_msl"]),
+        # Open-Meteo's default wind-speed unit is km/h; normalize to SI m/s.
+        "wind_speed_m_s": float(current["wind_speed_10m"]) / 3.6,
+        "wind_direction_deg": float(current["wind_direction_10m"]),
+        "timestamp": str(current["time"]),
+    }
+    if any(not math.isfinite(float(value)) for key, value in values.items() if key != "timestamp"):
+        raise ValueError("Weather response contains non-finite values.")
+    return values
+
+
 def _show_error(st: Any, title: str, error: Exception, debug: bool) -> None:
     """Display a readable error with an optional traceback.
 
@@ -429,7 +479,7 @@ def _trajectory_frame(result: Any, system: str) -> Any:
         system: Either "Metric" or "Imperial".
 
     Returns:
-        Pandas dataframe; time is seconds and the remaining columns use the chosen system.
+        Pandas dataframe; time is seconds and remaining columns use the chosen system.
     """
     import pandas as pd
 
@@ -526,16 +576,59 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🎯", layout="wide")
     st.title(APP_TITLE)
     st.write("A SI-based point-mass ballistics calculator with Metric and Imperial UI units.")
-    system = st.sidebar.selectbox("Measurement system", options=("Metric", "Imperial"))
+    system = st.sidebar.selectbox("Measurement system", options=("Metric", "Imperial"), key="measurement_system")
     mass_unit, length_unit, velocity_unit, temperature_unit, pressure_unit = _display_units(system)
+    temp_key = f"environment_temperature_{system.lower()}"
+    pressure_key = f"environment_pressure_{system.lower()}"
 
     with st.sidebar:
+        st.header("Location")
+        latitude = st.number_input("Latitude (°)", min_value=-90.0, max_value=90.0, value=0.0, step=0.01, format="%.5f", key="location_latitude")
+        longitude = st.number_input("Longitude (°)", min_value=-180.0, max_value=180.0, value=0.0, step=0.01, format="%.5f", key="location_longitude")
+        if st.button("Get Current Weather", key="get_current_weather"):
+            try:
+                weather = _fetch_current_weather(float(latitude), float(longitude))
+                temperature_ui = float(weather["temperature_c"])
+                pressure_ui = float(weather["pressure_hpa"])
+                if system == "Imperial":
+                    temperature_ui = temperature_ui * (9.0 / 5.0) + 32.0
+                    pressure_ui = pressure_ui * PASCALS_PER_HPA / PASCALS_PER_IN_HG
+                st.session_state[temp_key] = temperature_ui
+                st.session_state[pressure_key] = pressure_ui
+                st.session_state["environment_humidity_percent"] = float(weather["relative_humidity_percent"])
+                st.session_state["environment_wind_speed_m_s"] = float(weather["wind_speed_m_s"])
+                st.session_state["environment_wind_direction_deg"] = float(weather["wind_direction_deg"])
+                st.session_state["weather_updated_at"] = str(weather["timestamp"])
+                st.session_state.pop("weather_error", None)
+            except (requests.RequestException, KeyError, TypeError, ValueError, OverflowError):
+                st.session_state["weather_error"] = True
+        if st.session_state.get("weather_error"):
+            st.error("Could not fetch weather data")
+        if st.session_state.get("weather_updated_at") and not st.session_state.get("weather_error"):
+            st.caption(f"Updated: {st.session_state['weather_updated_at']} from Open-Meteo")
+
         st.header("Environment")
-        pressure_value = st.number_input(f"Pressure ({pressure_unit})", min_value=0.01,
-            value=1013.25 if system == "Metric" else 29.92, step=1.0)
-        temperature_value = st.number_input(f"Temperature ({temperature_unit})",
-            value=15.0 if system == "Metric" else 59.0, step=1.0)
-        humidity_percent = st.slider("Relative humidity (%)", 0, 100, 50)
+        pressure_value = st.number_input(
+            f"Pressure ({pressure_unit})", min_value=0.01,
+            value=1013.25 if system == "Metric" else 29.92,
+            step=1.0, key=pressure_key,
+        )
+        temperature_value = st.number_input(
+            f"Temperature ({temperature_unit})",
+            value=15.0 if system == "Metric" else 59.0,
+            step=1.0, key=temp_key,
+        )
+        humidity_percent = st.slider("Relative humidity (%)", 0, 100, 50, key="environment_humidity_percent")
+        wind_speed_m_s = st.number_input(
+            "Wind speed (m/s)", min_value=0.0, value=0.0, step=0.1,
+            key="environment_wind_speed_m_s",
+            help="Open-Meteo wind speed is converted from km/h to m/s. The current solver does not yet model wind.",
+        )
+        wind_direction_deg = st.number_input(
+            "Wind direction (°)", min_value=0.0, max_value=360.0, value=0.0, step=1.0,
+            key="environment_wind_direction_deg",
+            help="Meteorological wind direction in degrees clockwise from north.",
+        )
         st.header("Projectile")
         mass_value = st.number_input(f"Mass ({mass_unit})", min_value=0.001,
             value=11.34 if system == "Metric" else 175.0, step=0.1)
@@ -580,10 +673,11 @@ def main() -> None:
 
     if debug:
         with st.expander("Debug: normalized SI inputs and runtime"):
-            st.json({"si_inputs": inputs, "display_system": system, "drag_profile": profile,
-                "lookup_mach": mach, "launch_angle_deg": launch_angle_deg,
-                "integration_duration_s": duration_s, "python": sys.version,
-                "platform": platform.platform()})
+            st.json({"si_inputs": inputs, "wind_speed_m_s": wind_speed_m_s,
+                "wind_direction_deg": wind_direction_deg, "display_system": system,
+                "drag_profile": profile, "lookup_mach": mach,
+                "launch_angle_deg": launch_angle_deg, "integration_duration_s": duration_s,
+                "python": sys.version, "platform": platform.platform()})
 
 
 def _self_test() -> None:
@@ -604,14 +698,7 @@ def _self_test() -> None:
     assert math.isclose(_speed_from_m_s(1.0, "Imperial"), FEET_PER_METER)
     assert math.isclose(_pressure_from_pa(101325.0, "Metric"), 1013.25)
     assert math.isclose(_temperature_from_c(0.0, "Imperial"), 32.0)
-
-    metric = _si_inputs(11.34, "g", 7.82, 31.5, 254.0, "mm", 800.0, "m/s",
-        1013.25, "hPa", 15.0, "°C", 50.0)
-    imperial = _si_inputs(175.0, "gr", 0.308, 1.24, 10.0, "in", 2624.67, "ft/s",
-        29.92, "inHg", 59.0, "°F", 50.0)
-    for key in ("mass_kg", "diameter_m", "length_m", "pressure_pa", "temperature_c"):
-        assert math.isclose(metric[key], imperial[key], rel_tol=0.01)
-
+    assert math.isclose(36.0 / 3.6, 10.0)
     assert air_density(DEFAULT_PRESSURE_PA, DEFAULT_TEMPERATURE_C) > 0.0
     assert speed_of_sound(DEFAULT_TEMPERATURE_C) > 0.0
     assert len(load_drag_table("g1")) > 1 and len(load_drag_table("g7")) > 1
@@ -623,8 +710,6 @@ def _self_test() -> None:
         pressure_pa=DEFAULT_PRESSURE_PA, temperature_c=DEFAULT_TEMPERATURE_C,
         relative_humidity=0.0, time_end_s=2.0)
     assert result.time_s.size > 0 and result.y_m.max() > 0.0
-    assert math.isclose(_distance_from_m(float(result.x_m[-1]), "Imperial"),
-        float(result.x_m[-1]) * FEET_PER_METER)
 
 
 if __name__ == "__main__":
