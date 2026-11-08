@@ -66,7 +66,6 @@ def _adaptive_range_samples(max_range_m: float, zero_range_m: float) -> np.ndarr
     """
     if max_range_m <= 0.0:
         return np.array([0.0], dtype=float)
-
     positions = [0.0]
     boundaries = (zero_range_m, 2.0 * zero_range_m, max_range_m)
     steps = (NEAR_ZERO_STEP_M, MID_RANGE_STEP_M, FAR_RANGE_STEP_M)
@@ -103,13 +102,14 @@ def projectile_derivative(
     _, _, _, vx, vy, vz = state
     velocity = np.array([vx, vy, vz], dtype=float)
     speed = float(np.linalg.norm(velocity))
-
     if speed <= 1e-12:
         return np.array([vx, vy, vz, 0.0, -GRAVITY_M_S2, 0.0], dtype=float)
 
     rho = air_density(pressure_pa, temperature_c, relative_humidity)
     sound_speed = speed_of_sound(temperature_c, pressure_pa, relative_humidity)
     mach = speed / sound_speed
+    # interpolate_cd (the Cd lookup) is deliberately evaluated on every RHS
+    # call, i.e. at each RK45 integration stage, not only at output samples.
     cd = interpolate_cd(mach, drag_profile)
     if ballistic_coefficient is not None:
         if not math.isfinite(ballistic_coefficient) or ballistic_coefficient <= 0.0:
@@ -267,7 +267,6 @@ if __name__ == "__main__":
         ballistic_coefficient=0.35,
         zero_range_m=100.0,
     )
-
     assert result.time_s.size > 0
     assert np.all(np.isfinite(result.x_m))
     assert np.all(np.isfinite(result.y_m))
