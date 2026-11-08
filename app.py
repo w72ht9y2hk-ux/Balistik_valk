@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Tuple
 
 
-APP_TITLE: str = "Balistik_valk Ballistics"
+APP_TITLE: str = "Balistik_valk"
 DEFAULT_PRESSURE_PA: float = 101325.0
 DEFAULT_TEMPERATURE_C: float = 15.0
 DEFAULT_MASS_KG: float = 0.01134
