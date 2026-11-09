@@ -5,3 +5,6 @@ streamlit
 pandas
 pytest
 requests
+fpdf2
+qrcode[pil]
+pillow
