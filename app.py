@@ -414,6 +414,20 @@ def main() -> None:
             plt.close(figure)
             st.dataframe(output, use_container_width=True, hide_index=True)
             st.download_button("Download trajectory CSV", output.to_csv(index=False).encode("utf-8"), "trajectory.csv", "text/csv")
+            from dope_card import generate_dope_card
+            dope_params = {
+                "bullet_name": bullet_label_str if 'bullet_label_str' in locals() else "Custom Load",
+                "zero_range_m": zero_range_m,
+                "launch_speed_m_s": velocity_m_s,
+                "ballistic_coefficient": float(bc) if bullet and bc_profile else 0.462,
+                "twist_m_per_turn": _to_si(float(twist), units, "twist"),
+                "temperature_c": temperature_c,
+                "pressure_pa": pressure_pa,
+                "relative_humidity": humidity_fraction,
+            }
+            dope_pdf_bytes = generate_dope_card(dope_params, result, stability=sg)
+            st.download_button("📋 Download DOPE Card (PDF)", data=dope_pdf_bytes, file_name="dope_card.pdf", mime="application/pdf")
+
 
             st.subheader("Wind & Drift")
             drift_table = pd.DataFrame({"Range (m)": ranges_m, "Lateral wind drift (cm)": lateral_m * 100.0})
@@ -443,3 +457,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
